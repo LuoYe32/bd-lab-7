@@ -1,0 +1,6 @@
+outs:
+- md5: bf94df9ab72109282d7851a7016f9313.dir
+  size: 2592
+  nfiles: 8
+  hash: md5
+  path: kmeans_model
