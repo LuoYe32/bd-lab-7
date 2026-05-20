@@ -1,13 +1,9 @@
 from pyspark.sql.functions import count
 
 from src.config.config import ProjectConfig
-from src.data.qdrant_loader import QdrantDataLoader
 from src.evaluation.evaluator import ClusteringModelEvaluator
 from src.features.builder import FeatureBuilder
 from src.models.kmeans_model import KMeansClusteringModel
-from src.storage.qdrant_client import QdrantClientFactory
-from src.storage.qdrant_initializer import QdrantInitializer
-from src.storage.qdrant_sender import QdrantResultSender
 from src.utils.logger import LoggerFactory
 from src.utils.spark_manager import SparkManager
 
@@ -16,9 +12,7 @@ class ClusteringPipeline:
     def __init__(self):
         self.config = ProjectConfig()
         self.logger = LoggerFactory.get_logger(self.__class__.__name__)
-
         self.spark_manager = SparkManager()
-        self.client = QdrantClientFactory(self.config.qdrant).create_client()
 
     def run(self) -> None:
         self.logger.info("Starting clustering pipeline...")
@@ -30,13 +24,10 @@ class ClusteringPipeline:
     def _execute(self) -> None:
         spark = self.spark_manager.create_session()
 
-        loader = QdrantDataLoader(
-            spark=spark,
-            client=self.client,
-            collection_name=self.config.qdrant.input_collection,
-            selected_columns=self.config.data.selected_columns,
-            batch_size=self.config.qdrant.scroll_batch_size,
-        )
+        self.logger.info("Loading preprocessed data from %s...", self.config.data.preprocessed_path)
+        source_df = spark.read.parquet(self.config.data.preprocessed_path)
+        self.logger.info("Loaded rows: %s", source_df.count())
+
         feature_builder = FeatureBuilder(
             input_columns=self.config.data.selected_columns,
             features_col=self.config.model.features_col,
@@ -53,16 +44,6 @@ class ClusteringPipeline:
             prediction_col=self.config.model.prediction_col,
         )
 
-        initializer = QdrantInitializer(self.client)
-        initializer.recreate_collection(
-            collection_name=self.config.qdrant.output_collection,
-            vector_size=self.config.qdrant.vector_size,
-        )
-
-        self.logger.info("Loading source data from Qdrant...")
-        source_df = loader.load()
-        self.logger.info("Loaded rows from Qdrant: %s", source_df.count())
-
         self.logger.info("Building Spark ML features...")
         featured_df = feature_builder.build(source_df)
 
@@ -74,28 +55,18 @@ class ClusteringPipeline:
 
         self._log_evaluation(model, evaluator, predictions_df)
 
-        self.logger.info("Sending clustering results to Qdrant...")
-        sender = QdrantResultSender(
-            client=self.client,
-            collection_name=self.config.qdrant.output_collection,
-            selected_columns=self.config.data.selected_columns,
-            features_col=self.config.model.scaled_features_col,
-            prediction_col=self.config.model.prediction_col,
-            batch_size=self.config.qdrant.upload_batch_size,
-        )
-        sender.send(predictions_df)
+        self.logger.info("Saving predictions to %s...", self.config.data.predictions_path)
+        predictions_df.select(
+            *self.config.data.selected_columns,
+            self.config.model.prediction_col,
+        ).write.mode("overwrite").parquet(self.config.data.predictions_path)
 
         self.logger.info("Saving trained model...")
         model.save(self.config.data.model_path)
 
         self.logger.info("Pipeline finished successfully.")
 
-    def _log_evaluation(
-        self,
-        model: KMeansClusteringModel,
-        evaluator: ClusteringModelEvaluator,
-        predictions_df,
-    ) -> None:
+    def _log_evaluation(self, model, evaluator, predictions_df) -> None:
         silhouette_score = evaluator.evaluate(predictions_df)
         self.logger.info("Silhouette score: %.4f", silhouette_score)
 
